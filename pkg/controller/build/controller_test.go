@@ -32,6 +32,7 @@ import (
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 
 	v1alpha1 "github.com/knative/build/pkg/apis/build/v1alpha1"
 	"github.com/knative/build/pkg/client/clientset/versioned/fake"
@@ -232,11 +233,6 @@ func TestTimeoutFlows(t *testing.T) {
 	bldr := &nop.Builder{}
 
 	build := newBuild("test")
-	buffer, err := time.ParseDuration("10m")
-	if err != nil {
-		t.Errorf("Error parsing duration")
-	}
-
 	build.Spec.Timeout = "1s"
 
 	f := &fixture{
@@ -269,6 +265,10 @@ func TestTimeoutFlows(t *testing.T) {
 	}
 
 	// Update status to past time by substracting buffer time
+	buffer, err := time.ParseDuration("10m")
+	if err != nil {
+		t.Errorf("Error parsing duration")
+	}
 	first.Status.CreationTime.Time = metav1.Now().Time.Add(-buffer)
 
 	if builder.IsDone(&first.Status) {
@@ -281,10 +281,8 @@ func TestTimeoutFlows(t *testing.T) {
 	// We have to manually update the index, or the controller won't see the update.
 	f.updateIndex(i, []*v1alpha1.Build{first})
 
-	// Run a second iteration of the syncHandler.
-	if err := c.syncHandler(getKey(build, t)); err == nil {
-		t.Errorf("Expect syncing build to error with timeout")
-	}
+	// process the work item in queue
+	c.processNextWorkItem()
 
 	expectedTimeoutMsg := "Warning BuildTimeout Build \"test\" failed to finish within \"1s\""
 	for i := 0; i < 2; i++ {
@@ -296,6 +294,181 @@ func TestTimeoutFlows(t *testing.T) {
 			}
 		case <-time.After(4 * time.Second):
 			t.Fatalf("No events published")
+		}
+	}
+}
+
+func TestBuildTimeoutControllerFlow(t *testing.T)  {
+	stopCh := make(chan struct{})
+	eventCh := make(chan string, 16)
+	defer close(stopCh)
+	defer close(eventCh)
+
+	buildClient := fake.NewSimpleClientset()
+	kubeClient := k8sfake.NewSimpleClientset()
+
+	buildInformerFactor := informers.NewSharedInformerFactory(buildClient, noResyncPeriod)
+	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, noResyncPeriod)
+	logger := zap.NewExample().Sugar()
+
+	c := NewController(&nop.Builder{}, kubeClient, buildClient, kubeInformerFactory, buildInformerFactor, logger).(*Controller)
+	c.recorder = &record.FakeRecorder{
+		Events: eventCh,
+	}
+
+	buildInformerFactor.Start(stopCh)
+	kubeInformerFactory.Start(stopCh)
+
+	// run the build controller
+	go func() {
+		c.Run(2, stopCh)
+	}()
+
+	mockBuildName := "test"
+
+	// create the build resource
+	build := newBuild(mockBuildName)
+	buildClient.BuildV1alpha1().Builds(metav1.NamespaceDefault).Create(build)
+
+	// change me
+	// currently, the following events are expected to occur
+	//    create a build resource -> trigger an
+	// 1. build add event
+	//    exec syncHandler -> update status after the build execution, trigger an
+	// 2. build update event
+	//    exec syncHandler -> update status after the build timeout, trigger an
+	// 3. build update event
+	//    exec syncHandler -> build has done, the ending of process
+	//
+	// in summary, we should see the first MessageResourceSynced event, then BuildExecuteFailed event
+	// and the final MessageResourceSynced event (totally 2 MessageResourceSynced event and 1 BuildExecuteFailed event)
+
+	// It must a build timeout status as nop builder updates the build.Status.CreationTime to time.Time
+	// and the syncHandler uses (time.Now() - build.Status.CreationTime) elapsed time to detect build timeout
+
+	deadline := time.After(4 * time.Second)
+
+	buildSyncedCnt := 0;
+	buildTimeoutCnt := 0;
+
+detect:
+	for {
+		select {
+		case statusEvent := <-eventCh:
+			// grep with the reason of event
+			if strings.Contains(statusEvent, SuccessSynced) {
+				buildSyncedCnt++
+			}
+			if strings.Contains(statusEvent, "BuildTimeout") {
+				buildTimeoutCnt++
+			}
+
+			if buildSyncedCnt == 2 && buildTimeoutCnt == 1 {
+				break detect
+			}
+		case <- deadline:
+			t.Errorf("Timeout to wait BuildTimeout event")
+			break detect
+		}
+	}
+}
+
+func TestTimeoutBuildReEnqueue(t *testing.T) {
+	stopCh := make(chan struct{})
+	eventCh := make(chan string, 16)
+	defer close(stopCh)
+	defer close(eventCh)
+
+	build := newBuild("test")
+	build.Spec.Timeout = "1s"
+
+	f := &fixture{
+		t:           t,
+		client:      fake.NewSimpleClientset(build),
+		kubeclient:  k8sfake.NewSimpleClientset(),
+	}
+
+	c, buildInformerFactor, _ := f.newController(&nop.Builder{}, eventCh)
+
+	// let the Lister of Informer and Clientset can get the build resource
+	f.updateIndex(buildInformerFactor, []*v1alpha1.Build{build})
+
+	timeout, err := time.ParseDuration(build.Spec.Timeout)
+	if err != nil {
+		t.Errorf("Error parsing duration")
+		return
+	}
+
+	drainWorkqueue := func (ctrlWorkqueue workqueue.RateLimitingInterface) bool {
+		for ctrlWorkqueue.Len() > 0 {
+			obj, shutdown := c.workqueue.Get()
+
+			if shutdown {
+				return false
+			}
+
+			ctrlWorkqueue.Forget(obj)
+			ctrlWorkqueue.Done(obj)
+		}
+
+		return true
+	}
+
+	// updateBuild will add at least one build resource into workqueue
+
+	// build add
+	if err := c.syncHandler(getKey(build, t)); err != nil {
+		t.Errorf("Not Expect error when syncing build")
+		return
+	}
+
+	select {
+	case <- time.After(5 * time.Second):
+		if c.workqueue.Len() != 1 {
+			t.Errorf("ReEnqueue a build resource failed; wanted %d got %d", 1, c.workqueue.Len())
+			return
+		}
+	}
+
+	drainWorkqueue(c.workqueue)
+
+	// build update
+	buildCur := newBuild("test")
+	buildCur.Spec.Timeout = "2s"
+
+	// 1. unchanging
+	c.updateBuild(build, build)
+	select {
+	case <- time.After(timeout):
+		if c.workqueue.Len() != 1 {
+			t.Errorf("ReEnqueue a build resource failed; wanted %d got %d", 1, c.workqueue.Len())
+			return
+		}
+	}
+
+	drainWorkqueue(c.workqueue)
+
+	// 2. changed but build was timeout
+	c.updateBuild(build, buildCur)
+	select {
+	case <- time.After(2 * time.Second):
+		if c.workqueue.Len() != 1 {
+			t.Errorf("ReEnqueue a build resource failed; wanted %d got %d", 1, c.workqueue.Len())
+			return
+		}
+	}
+
+	drainWorkqueue(c.workqueue)
+
+	// 3. changed and build has not timeout
+	buildCur.Status.CreationTime = metav1.Now()
+
+	c.updateBuild(build, buildCur)
+	select {
+	case <- time.After(8 * time.Second):
+		if c.workqueue.Len() != 2 {
+			t.Errorf("ReEnqueue a build resource failed; wanted %d got %d", 2, c.workqueue.Len())
+			return
 		}
 	}
 }

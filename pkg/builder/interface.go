@@ -24,6 +24,8 @@ import (
 	v1alpha1 "github.com/knative/build/pkg/apis/build/v1alpha1"
 )
 
+const DefaultTimeout = "10m"
+
 // Operation defines the interface for interacting with an Operation of a particular BuildProvider.
 type Operation interface {
 	// Name provides the unique name for this operation, see OperationFromStatus.
@@ -85,13 +87,14 @@ func IsTimeout(status *v1alpha1.BuildStatus, buildTimeout string) bool {
 	}
 
 	if buildTimeout == "" {
-		timeout = 10 * time.Minute
-	} else {
-		timeout, err = time.ParseDuration(buildTimeout)
-		if err != nil {
-			return false
-		}
+		buildTimeout = DefaultTimeout
 	}
+
+	timeout, err = time.ParseDuration(buildTimeout)
+	if err != nil {
+		return false
+	}
+
 	return time.Since(status.CreationTime.Time).Seconds() > timeout.Seconds()
 }
 
